@@ -3,7 +3,7 @@ from io import BytesIO
 from pathlib import Path
 from audio_features import extract_features
 
-
+import joblib
 import librosa
 import numpy as np
 import soundfile as sf
@@ -15,6 +15,10 @@ app = FastAPI(
     description="Audio analysis backend for the VoiceShield capstone.",
     version="0.2.0",
 )
+
+MODEL_PATH = Path("models/voice_detector.joblib")
+
+model = joblib.load(MODEL_PATH)
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +40,7 @@ def home():
     return {
         "project": "VoiceShield",
         "status": "online",
-        "detection_model": "not_integrated",
+        "detection_model": "logistic_regression_mfcc_v1",
     }
 
 
@@ -107,19 +111,10 @@ async def analyze_audio(file: UploadFile = File(...)):
     peak_amplitude = float(np.max(np.abs(audio)))
     rms_amplitude = float(np.sqrt(np.mean(audio ** 2)))
 
-    # 6. Convert to mono for feature extraction
-    mono_audio = audio.mean(axis=1)
-
-    # 7. Extract 13 MFCC coefficients using Librosa
+    
+    # 6. Extract the shared 26-feature representation
     try:
-        mfcc = librosa.feature.mfcc(
-            y=mono_audio,
-            sr=sample_rate,
-            n_mfcc=13,
-        )
-
-        # Average each coefficient across audio frames
-        mfcc_mean = mfcc.mean(axis=1)
+        feature_vector = extract_features(audio_bytes)
 
     except Exception as exc:
         raise HTTPException(
@@ -127,7 +122,27 @@ async def analyze_audio(file: UploadFile = File(...)):
             detail=f"Audio feature extraction failed: {str(exc)}",
         )
 
-    # 8. Return audio metadata and extracted features
+
+    # 7. Predict whether the audio is genuine or spoofed
+    try:
+        prediction = int(model.predict([feature_vector])[0])
+        probabilities = model.predict_proba([feature_vector])[0]
+
+        spoof_probability = float(probabilities[1])
+
+        classification = "spoof" if prediction == 1 else "bonafide"
+
+        risk_score = round(spoof_probability * 100, 2)
+
+        confidence = round(float(max(probabilities)) * 100, 2)
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Model prediction failed: {str(exc)}",
+        )
+
+    # 8. Return audio metadata, features, and prediction
     return {
         "filename": Path(file.filename or "audio").name,
         "file_size_bytes": len(audio_bytes),
@@ -138,17 +153,19 @@ async def analyze_audio(file: UploadFile = File(...)):
         "rms_amplitude": round(rms_amplitude, 4),
         "features": {
             "mfcc_coefficients": 13,
+            "feature_count": len(feature_vector),
             "mfcc_mean": [
                 round(float(value), 4)
-                for value in mfcc_mean
+                for value in feature_vector[:13]
+            ],
+            "mfcc_std": [
+                round(float(value), 4)
+                for value in feature_vector[13:]
             ],
         },
-        "classification": None,
-        "risk_score": None,
-        "confidence": None,
-        "detection_model": "not_integrated",
-        "message": (
-            "Audio decoded and MFCC features extracted successfully. "
-            "Voice-cloning classification is not available yet."
-        ),
+        "classification": classification,
+        "risk_score": risk_score,
+        "confidence": confidence,
+        "detection_model": "logistic_regression_mfcc_v1",
+        "message": "Audio classification completed successfully.",
     }
